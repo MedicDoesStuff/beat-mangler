@@ -1,0 +1,167 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# \ud83c\udf9b Beat Mangler\n",
+        "**Essentia-powered beat manipulation for audio & video.**\n",
+        "\n",
+        "| Mode | What it does |\n",
+        "|------|--------------|\n",
+        "| `remove` | Drops every other beat (half-time feel) |\n",
+        "| `swap` | Swaps beats 2 & 4 in every bar of 4 |\n",
+        "| `reverse` | Plays beats back in reverse order |\n",
+        "| `shuffle` | Randomises all beat positions |\n",
+        "| `repeat` | Stutters \u2014 each beat plays N times in a row |\n",
+        "| `interleave` | Alternates beats from two different files |"
+      ],
+      "metadata": {
+        "id": "header_md"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# \u2500\u2500 Cell 1 \u00b7 Install dependencies & clone repo \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "import subprocess, sys, os\n",
+        "\n",
+        "# Install system & Python dependencies\n",
+        "subprocess.run([\"apt-get\", \"install\", \"-q\", \"-y\", \"ffmpeg\"], capture_output=True)\n",
+        "subprocess.run(\n",
+        "    [sys.executable, \"-m\", \"pip\", \"install\", \"-q\",\n",
+        "     \"essentia\", \"moviepy\", \"pydub\", \"numpy\", \"tqdm\"],\n",
+        "    check=True,\n",
+        ")\n",
+        "\n",
+        "# \u2500\u2500 Clone or update the repo \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "REPO_URL  = \"https://github.com/MedicDoesStuff/beat-mangler.git\"  # \u2190 change this\n",
+        "REPO_DIR  = \"/content/beat-mangler\"\n",
+        "\n",
+        "if os.path.isdir(REPO_DIR):\n",
+        "    print(\"\u21bb  Repo already present \u2014 pulling latest changes...\")\n",
+        "    subprocess.run([\"git\", \"-C\", REPO_DIR, \"pull\", \"--ff-only\"], check=True)\n",
+        "else:\n",
+        "    print(\"\u2b07  Cloning repo...\")\n",
+        "    subprocess.run([\"git\", \"clone\", \"--depth\", \"1\", REPO_URL, REPO_DIR], check=True)\n",
+        "\n",
+        "# Add repo to path so we can import beat_mangler\n",
+        "if REPO_DIR not in sys.path:\n",
+        "    sys.path.insert(0, REPO_DIR)\n",
+        "\n",
+        "print(\"\u2705 Ready.\")"
+      ],
+      "metadata": {
+        "id": "cell_install"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# \u2500\u2500 Cell 2 \u00b7 Upload your file(s) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "from google.colab import files\n",
+        "\n",
+        "print(\"Upload one file for modes 1\u20135, or TWO files for interleave (mode 6).\")\n",
+        "uploaded = files.upload()\n",
+        "\n",
+        "uploaded_paths = list(uploaded.keys())\n",
+        "for p in uploaded_paths:\n",
+        "    print(f\"   \u2713  {p}\")"
+      ],
+      "metadata": {
+        "id": "cell_upload"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# \u2500\u2500 Cell 3 \u00b7 Run Beat Mangler \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "import beat_mangler as fakers\n",
+        "from IPython.display import Audio, display\n",
+        "\n",
+        "# \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n",
+        "# \u2502  CONFIG \u2014 edit these values, then run the cell                         \u2502\n",
+        "# \u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n",
+        "# \u2502  mode options:                                                          \u2502\n",
+        "# \u2502    \"remove\"     \u2014 drop every other beat                                 \u2502\n",
+        "# \u2502    \"swap\"       \u2014 swap beats 2 & 4 in every bar                         \u2502\n",
+        "# \u2502    \"reverse\"    \u2014 reverse beat order                                    \u2502\n",
+        "# \u2502    \"shuffle\"    \u2014 randomise beat positions                              \u2502\n",
+        "# \u2502    \"repeat\"     \u2014 stutter (set repeat_times below)                      \u2502\n",
+        "# \u2502    \"interleave\" \u2014 alternate beats from two files (set path_b below)     \u2502\n",
+        "# \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n",
+        "\n",
+        "MODE         = \"remove\"      # \u2190 choose your mode\n",
+        "OUTPUT_FMT   = \"flac\"        # \u2190 \"mp3\" or \"flac\"\n",
+        "REPEAT_TIMES = 2             # \u2190 only used when MODE == \"repeat\"\n",
+        "INTERLEAVE_GROUP = 1         # \u2190 only used when MODE == \"interleave\"\n",
+        "\n",
+        "# Paths \u2014 auto-filled from the upload cell above\n",
+        "# Override manually if needed, e.g. path_a = \"/content/mysong.mp3\"\n",
+        "path_a = uploaded_paths[0]\n",
+        "path_b = uploaded_paths[1] if len(uploaded_paths) > 1 else None\n",
+        "\n",
+        "# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "\n",
+        "if MODE == \"interleave\":\n",
+        "    if path_b is None:\n",
+        "        raise ValueError(\"Interleave mode needs two uploaded files \u2014 re-run Cell 2 and upload both.\")\n",
+        "    out = fakers.process_interleave(path_a, path_b, INTERLEAVE_GROUP, OUTPUT_FMT)\n",
+        "\n",
+        "elif fakers.is_video(path_a):\n",
+        "    out = fakers.process_video(path_a, MODE, REPEAT_TIMES)\n",
+        "\n",
+        "else:\n",
+        "    out = fakers.process_audio(path_a, MODE, OUTPUT_FMT, REPEAT_TIMES)\n",
+        "\n",
+        "fakers.preview(out, file_is_video=fakers.is_video(out))"
+      ],
+      "metadata": {
+        "id": "cell_run"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# \u2500\u2500 Cell 4 \u00b7 Download output \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "from google.colab import files\n",
+        "files.download(out)"
+      ],
+      "metadata": {
+        "id": "cell_download"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# \u2500\u2500 Cell 5 \u00b7 Cleanup (optional) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "# Free up Colab disk space when you're done.\n",
+        "!rm -rf /content/*\n",
+        "print(\"\ud83d\uddd1  /content cleared.\")"
+      ],
+      "metadata": {
+        "id": "cell_cleanup"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ],
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "name": "python3"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
