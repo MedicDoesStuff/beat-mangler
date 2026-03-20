@@ -1,7 +1,6 @@
 """
-fakers.py — Beat Mangler core library
-Essentia-powered beat manipulation for audio & video.
-Works locally and in Google Colab.
+fakers.py - Beat Mangler core library.
+Essentia-powered beat manipulation for audio and video.
 """
 
 import base64
@@ -11,30 +10,29 @@ import random
 import re
 import subprocess
 import tempfile
-import threading
-import time
+from concurrent.futures import ThreadPoolExecutor
 
 import essentia.standard as es
 import numpy as np
+import soundfile as sf
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
 from tqdm.auto import tqdm
 
-# Optional heavy imports (only needed for video)
 try:
     from moviepy.editor import VideoFileClip, concatenate_videoclips
-    _MOVIEPY_AVAILABLE = True
+    _MOVIEPY = True
 except ImportError:
-    _MOVIEPY_AVAILABLE = False
+    _MOVIEPY = False
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
 
-AUDIO_FMT_MAP = {
+AUDIO_FMT = {
     "mp3": "mp3", "wav": "wav", "flac": "flac",
     "ogg": "ogg", "aac": "aac", "m4a": "mp4", "aiff": "aiff",
 }
@@ -48,265 +46,603 @@ MODE_SUFFIXES = {
     "interleave": "interleaved",
 }
 
-SPINNER    = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-SIMPLE_BAR = "{l_bar}{bar}| {elapsed}"
+_BAR = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"
+
+# (ffmpeg codec, display name, preset flag value)
+_GPU_CODECS = [
+    ("h264_nvenc", "NVIDIA NVENC", "slow"),
+    ("h264_amf",   "AMD AMF",     "quality"),
+    ("h264_qsv",   "Intel QSV",   "slow"),
+]
+
+# hwaccel methods to probe for decoding
+_HWACCEL_METHODS = ["cuda", "qsv", "d3d11va", "vaapi", "dxva2"]
+
+_encoder_cache = None
+_hwaccel_cache = None
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
-def is_video(path: str) -> bool:
+def _is_video(path):
     return os.path.splitext(path)[1].lower() in VIDEO_EXTS
 
 
-def src_fmt(path: str) -> str:
-    return AUDIO_FMT_MAP.get(os.path.splitext(path)[1].lower().lstrip("."), "mp3")
+def _src_fmt(path):
+    return AUDIO_FMT.get(os.path.splitext(path)[1].lower().lstrip("."), "mp3")
 
 
-def make_output_path(input_path: str, suffix: str, ext: str) -> str:
-    return f"{os.path.splitext(input_path)[0]}_{suffix}.{ext}"
+def _out_path(path, suffix, ext):
+    return f"{os.path.splitext(path)[0]}_{suffix}.{ext}"
 
 
-def simple_bar(desc: str):
-    return tqdm(total=1, desc=desc, bar_format=SIMPLE_BAR)
+def _mb(path):
+    return os.path.getsize(path) / (1024 * 1024)
 
 
-def load_audio(path: str) -> AudioSegment:
-    return AudioSegment.from_file(path, format=src_fmt(path))
+def _print_stats(inp, out, in_dur, out_dur):
+    print(f"\nDone: {out}")
+    print(f"  Input:  {in_dur:.2f}s  ({_mb(inp):.1f} MB)")
+    print(f"  Output: {out_dur:.2f}s  ({_mb(out):.1f} MB)")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# VIDEO PROBING
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# NumPy-based audio I/O (replaces pydub for main pipeline)
+# ---------------------------------------------------------------------------
 
-def probe_video(path: str) -> dict:
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
-           "-show_streams", "-show_format", path]
-    info = json.loads(subprocess.run(cmd, capture_output=True, text=True).stdout)
-
-    vs  = next((s for s in info.get("streams", []) if s["codec_type"] == "video"), {})
-    as_ = next((s for s in info.get("streams", []) if s["codec_type"] == "audio"), {})
-
-    num, den = vs.get("r_frame_rate", "30/1").split("/")
-    raw_br   = vs.get("bit_rate") or info.get("format", {}).get("bit_rate", "0")
-
-    return {
-        "width":        int(vs.get("width",  1920)),
-        "height":       int(vs.get("height", 1080)),
-        "fps":          round(int(num) / int(den), 3),
-        "bitrate_kbps": max(1000, int(raw_br) // 1000),
-        "pix_fmt":      vs.get("pix_fmt", "yuv420p"),
-        "audio_sr":     int(as_.get("sample_rate", 44100)),
-        "audio_ch":     int(as_.get("channels", 2)),
-        "audio_kbps":   max(128, int(as_.get("bit_rate", "192000")) // 1000),
-    }
+def _load_np(path):
+    """Load audio file as float32 numpy array + sample rate."""
+    if _is_video(path):
+        tmp = tempfile.mktemp(suffix=".wav")
+        hwaccel_args = _hwaccel_decode_args()
+        cmd = hwaccel_args + [
+            "-i", path, "-vn", "-ac", "2", "-ar", "44100",
+            "-f", "wav", "-y", tmp,
+        ]
+        subprocess.run(["ffmpeg"] + cmd, capture_output=True, check=True)
+        data, sr = sf.read(tmp, dtype="float32")
+        os.remove(tmp)
+        return data, sr
+    data, sr = sf.read(path, dtype="float32")
+    return data, sr
 
 
-def build_video_export_params(probe: dict) -> dict:
-    br  = probe["bitrate_kbps"]
-    crf = "16" if br >= 8000 else "18" if br >= 4000 else "20" if br >= 2000 else "22" if br >= 1000 else "24"
-    audio_kbps = min(320, max(128, probe["audio_kbps"]))
+def _load_pydub(path):
+    """Load via pydub (only used for silence detection in interleave)."""
+    return AudioSegment.from_file(path, format=_src_fmt(path))
 
-    print(f"\n   📐 {probe['width']}×{probe['height']}  {probe['fps']} fps")
-    print(f"   🎞  Source bitrate ~{br} kbps → CRF {crf}")
-    print(f"   🔊 Audio {audio_kbps} kbps  ·  {probe['audio_sr']} Hz  ·  {probe['audio_ch']}ch")
 
-    return dict(
-        codec="libx264", audio_codec="aac",
-        fps=probe["fps"], bitrate=f"{br}k",
-        audio_bitrate=f"{audio_kbps}k", audio_fps=probe["audio_sr"],
-        preset="slow", verbose=False,
-        ffmpeg_params=["-crf", crf, "-pix_fmt", probe["pix_fmt"]],
+def _np_to_mono(samples):
+    """Downmix to mono for analysis."""
+    if samples.ndim > 1:
+        return samples.mean(axis=1).astype(np.float32)
+    return samples.astype(np.float32)
+
+
+def _slice_np(samples, sr, beat_times, duration, label=""):
+    """Slice numpy array at beat boundaries — near-zero overhead."""
+    bounds = [int(t * sr) for t in beat_times] + [min(int(duration * sr), len(samples))]
+    segs = []
+    for i in tqdm(range(len(beat_times)),
+                  desc=f"  Slicing {label}".rstrip(),
+                  unit="beat", bar_format=_BAR):
+        segs.append(samples[bounds[i]:bounds[i + 1]])
+    return segs
+
+
+def _stitch_np(segments):
+    """O(n) concatenation instead of O(n²) pydub sum."""
+    return np.concatenate(segments, axis=0)
+
+
+def _export_np(samples, sr, path, fmt):
+    """Export numpy samples to file. Uses soundfile or ffmpeg for mp3/aac."""
+    sf_formats = {"wav", "flac", "ogg", "aiff"}
+    if fmt in sf_formats:
+        sf.write(path, samples, sr, format=fmt.upper())
+    elif fmt in ("mp3", "aac", "m4a"):
+        tmp_wav = tempfile.mktemp(suffix=".wav")
+        sf.write(tmp_wav, samples, sr, format="WAV")
+        codec_map = {"mp3": "libmp3lame", "aac": "aac", "m4a": "aac"}
+        codec = codec_map.get(fmt, "libmp3lame")
+        ff_fmt = "mp4" if fmt == "m4a" else fmt
+        cmd = ["ffmpeg", "-y", "-i", tmp_wav, "-c:a", codec]
+        if fmt == "mp3":
+            cmd += ["-b:a", "320k"]
+        cmd += ["-f", ff_fmt, path]
+        subprocess.run(cmd, capture_output=True, check=True)
+        os.remove(tmp_wav)
+    else:
+        sf.write(path, samples, sr)
+
+
+# ---------------------------------------------------------------------------
+# Pydub helpers (only for interleave silence stripping)
+# ---------------------------------------------------------------------------
+
+def _pydub_to_np(seg):
+    """Convert pydub AudioSegment to numpy float32 array."""
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    if seg.channels > 1:
+        samples = samples.reshape(-1, seg.channels)
+    samples /= 2 ** (seg.sample_width * 8 - 1)
+    return samples, seg.frame_rate
+
+
+def _np_to_pydub(samples, sr, sample_width=2, channels=None):
+    """Convert numpy float32 array to pydub AudioSegment."""
+    if channels is None:
+        channels = samples.shape[1] if samples.ndim > 1 else 1
+    peak = np.max(np.abs(samples))
+    if peak > 0:
+        samples = samples / max(peak, 1.0)
+    int_samples = (samples * (2 ** (sample_width * 8 - 1) - 1)).astype(np.int16)
+    if int_samples.ndim > 1:
+        int_samples = int_samples.flatten()
+    return AudioSegment(
+        data=int_samples.tobytes(),
+        sample_width=sample_width,
+        frame_rate=sr,
+        channels=channels,
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# BEAT DETECTION
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# GPU encoder detection
+# ---------------------------------------------------------------------------
 
-def extract_wav(path: str) -> tuple:
-    """Return a mono 44 100 Hz WAV temp file and source duration in seconds."""
+def _test_encoder(codec):
+    """Attempt a single-frame encode to verify the encoder works."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i",
+             "color=black:s=64x64:d=0.1:r=1",
+             "-c:v", codec, "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _detect_encoder():
+    """Return (codec, label, preset) for the best available H.264 encoder."""
+    global _encoder_cache
+    if _encoder_cache is not None:
+        return _encoder_cache
+
+    print("  Probing encoders ...", end=" ", flush=True)
+    for codec, label, preset in _GPU_CODECS:
+        if _test_encoder(codec):
+            print(f"{label} ({codec})")
+            _encoder_cache = (codec, label, preset)
+            return _encoder_cache
+
+    print("no GPU encoder found, using libx264 (CPU)")
+    _encoder_cache = ("libx264", "CPU", "slow")
+    return _encoder_cache
+
+
+# ---------------------------------------------------------------------------
+# HW-accelerated decoding detection
+# ---------------------------------------------------------------------------
+
+def _test_hwaccel(method):
+    """Test whether an hwaccel method is available."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-hwaccel", method,
+             "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1:r=1",
+             "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _detect_hwaccel():
+    """Detect best available hardware decoding method. Cached."""
+    global _hwaccel_cache
+    if _hwaccel_cache is not None:
+        return _hwaccel_cache
+
+    print("  Probing HW decoders ...", end=" ", flush=True)
+    for method in _HWACCEL_METHODS:
+        if _test_hwaccel(method):
+            print(f"using {method}")
+            _hwaccel_cache = method
+            return _hwaccel_cache
+
+    print("none found, using CPU decoding")
+    _hwaccel_cache = ""
+    return _hwaccel_cache
+
+
+def _hwaccel_decode_args():
+    """Return ffmpeg args for hardware-accelerated decoding, or empty list."""
+    method = _detect_hwaccel()
+    if method:
+        return ["-hwaccel", method]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Video probing (ffprobe)
+# ---------------------------------------------------------------------------
+
+def _probe_video(path):
+    """Extract source video metadata with ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", path,
+    ]
+    info = json.loads(
+        subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    )
+
+    streams = info.get("streams", [])
+    fmt = info.get("format", {})
+    vs = next((s for s in streams if s["codec_type"] == "video"), {})
+    aus = next((s for s in streams if s["codec_type"] == "audio"), {})
+
+    num, den = vs.get("r_frame_rate", "30/1").split("/")
+    fps = round(int(num) / max(1, int(den)), 3)
+
+    v_br = vs.get("bit_rate")
+    a_br = aus.get("bit_rate", "192000")
+    if not v_br:
+        v_br = str(max(0, int(fmt.get("bit_rate", "0")) - int(a_br)))
+
+    return {
+        "width":      int(vs.get("width", 1920)),
+        "height":     int(vs.get("height", 1080)),
+        "fps":        fps,
+        "v_kbps":     max(500, int(v_br) // 1000),
+        "pix_fmt":    vs.get("pix_fmt", "yuv420p"),
+        "audio_sr":   int(aus.get("sample_rate", 44100)),
+        "audio_ch":   int(aus.get("channels", 2)),
+        "audio_kbps": max(128, int(a_br) // 1000),
+        "duration":   float(fmt.get("duration", 0)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Encoding parameter builders
+# ---------------------------------------------------------------------------
+
+def _encode_params(codec, preset, probe):
+    """Build moviepy write_videofile kwargs for the given encoder."""
+    br      = probe["v_kbps"]
+    abr     = min(320, max(128, probe["audio_kbps"]))
+    maxrate = int(br * 1.5)
+    bufsize = br * 2
+
+    params = ["-pix_fmt", probe["pix_fmt"], "-profile:v", "high"]
+
+    if codec == "h264_nvenc":
+        params += [
+            "-rc", "vbr",
+            "-b:v", f"{br}k",
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+        ]
+    elif codec == "h264_amf":
+        params += [
+            "-rc", "vbr_peak",
+            "-b:v", f"{br}k",
+            "-maxrate", f"{maxrate}k",
+        ]
+    elif codec == "h264_qsv":
+        params += [
+            "-b:v", f"{br}k",
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+        ]
+    else:
+        crf = (16 if br >= 8000 else 18 if br >= 4000 else
+               20 if br >= 2000 else 22 if br >= 1000 else 24)
+        params += [
+            "-crf", str(crf),
+            "-maxrate", f"{maxrate}k",
+            "-bufsize", f"{bufsize}k",
+        ]
+
+    return dict(
+        codec=codec,
+        preset=preset,
+        audio_codec="aac",
+        fps=probe["fps"],
+        audio_bitrate=f"{abr}k",
+        audio_fps=probe["audio_sr"],
+        verbose=False,
+        ffmpeg_params=params,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video writer (GPU with automatic CPU fallback)
+# ---------------------------------------------------------------------------
+
+def _write_video(clip, path, probe):
+    """Encode clip using the best available encoder with CPU fallback."""
+    codec, label, preset = _detect_encoder()
+    br  = probe["v_kbps"]
+    abr = min(320, max(128, probe["audio_kbps"]))
+    print(f"  Encoding with {label} | preset={preset}")
+    print(f"  Target: {probe['width']}x{probe['height']} @ {probe['fps']}fps, "
+          f"~{br} kbps video, {abr} kbps audio")
+
+    kwargs = _encode_params(codec, preset, probe)
+    logger = _VideoLogger(clip.duration)
+
+    try:
+        clip.write_videofile(path, logger=logger, **kwargs)
+        logger.close()
+        return
+    except Exception as exc:
+        logger.close()
+        if codec == "libx264":
+            raise
+        print(f"\n  {label} encoding failed: {exc}")
+        print("  Retrying with libx264 (CPU) ...")
+
+    kwargs = _encode_params("libx264", "slow", probe)
+    logger = _VideoLogger(clip.duration)
+    clip.write_videofile(path, logger=logger, **kwargs)
+    logger.close()
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg stream-copy concat (no re-encode)
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_concat_copy(segment_times, input_path, output_path, probe):
+    """Cut segments with ffmpeg stream copy and concatenate without re-encoding.
+
+    This avoids decoding/encoding entirely — 10-50× faster than re-encode.
+    Falls back to moviepy re-encode pipeline on failure.
+    """
+    tmp_dir = tempfile.mkdtemp()
+    list_file = os.path.join(tmp_dir, "concat.txt")
+    hwaccel_args = _hwaccel_decode_args()
+
+    parts = []
+    print("  Cutting segments (stream copy) ...")
+    for i in tqdm(range(len(segment_times)), desc="  Cutting",
+                  unit="seg", bar_format=_BAR):
+        ts, te = segment_times[i]
+        part = os.path.join(tmp_dir, f"part_{i:05d}.ts")
+        cmd = ["ffmpeg", "-y"]
+        cmd += hwaccel_args
+        cmd += [
+            "-ss", f"{ts:.6f}", "-to", f"{te:.6f}",
+            "-i", input_path,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-f", "mpegts",
+            part,
+        ]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            # Cleanup and signal failure
+            for p in parts:
+                if os.path.exists(p):
+                    os.remove(p)
+            if os.path.exists(list_file):
+                os.remove(list_file)
+            os.rmdir(tmp_dir)
+            return False
+        parts.append(part)
+
+    with open(list_file, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+
+    print("  Concatenating segments ...")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy", output_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+
+    # Cleanup temp files
+    for p in parts:
+        if os.path.exists(p):
+            os.remove(p)
+    if os.path.exists(list_file):
+        os.remove(list_file)
+    try:
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
+
+    return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Beat detection
+# ---------------------------------------------------------------------------
+
+def _extract_audio_to_wav(path):
+    """Extract/convert audio to mono 44100 Hz WAV temp file using ffmpeg with hwaccel."""
     tmp = tempfile.mktemp(suffix=".wav")
-    label = "📤 Extracting audio" if is_video(path) else "📤 Converting audio"
-    with simple_bar(label) as pb:
-        if is_video(path):
-            if not _MOVIEPY_AVAILABLE:
-                raise ImportError("moviepy is required for video. Install it with: pip install moviepy")
-            clip = VideoFileClip(path)
-            clip.audio.write_audiofile(
-                tmp, fps=44100, nbytes=2,
-                codec="pcm_s16le", verbose=False, logger=None,
-            )
-            dur = clip.duration
-            clip.close()
-        else:
-            AudioSegment.from_file(path, format=src_fmt(path)) \
-                .set_channels(1).set_frame_rate(44100).export(tmp, format="wav")
-            dur = AudioSegment.from_file(path).duration_seconds
-        pb.update(1)
-    return tmp, dur
-
-
-def extract_wav_from_segment(seg: AudioSegment) -> str:
-    """Export an in-memory AudioSegment to a temp mono WAV for Essentia."""
-    tmp = tempfile.mktemp(suffix=".wav")
-    seg.set_channels(1).set_frame_rate(44100).export(tmp, format="wav")
+    hwaccel_args = _hwaccel_decode_args() if _is_video(path) else []
+    cmd = ["ffmpeg", "-y"] + hwaccel_args + [
+        "-i", path, "-vn", "-ac", "1", "-ar", "44100",
+        "-f", "wav", tmp,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
     return tmp
 
 
-def detect_beats(wav_path: str, label: str = "") -> tuple:
-    """Run Essentia BeatTrackerMultiFeature in a thread; show a spinner."""
-    result = {}
-
-    def _run():
-        audio = es.MonoLoader(filename=wav_path, sampleRate=44100)()
-        bt, conf = es.BeatTrackerMultiFeature()(audio)
-        bpm = 60.0 / np.median(np.diff(bt)) if len(bt) > 1 else 0.0
-        result.update({"bt": list(bt), "bpm": bpm,
-                        "dur": len(audio) / 44100, "conf": conf})
-
-    t = threading.Thread(target=_run)
-    t.start()
-    for i in range(10_000):
-        if not t.is_alive():
-            break
-        tag = f" {label}" if label else ""
-        print(f"\r🎵 Detecting beats{tag} {SPINNER[i % len(SPINNER)]} ",
-              end="", flush=True)
-        time.sleep(0.1)
-    t.join()
-    tag = f" {label}" if label else ""
-    print(f"\r🎵 Beats detected!{tag}                    ")
-
-    bt = result["bt"]
-    print(f"   {len(bt)} beats  ·  {result['bpm']:.1f} BPM  ·  confidence {result['conf']:.3f}")
-    return bt, result["bpm"], result["dur"]
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SILENCE STRIPPING & BEAT ALIGNMENT  (used by interleave mode)
-# ════════════════════════════════════════════════════════════════════════════
-
-def strip_silence(audio: AudioSegment, label: str = "",
-                  thresh_db: float = -50, chunk_ms: int = 10):
-    """Remove leading & trailing silence before beat detection."""
-    lead  = detect_leading_silence(audio, silence_threshold=thresh_db, chunk_size=chunk_ms)
-    trail = detect_leading_silence(audio.reverse(), silence_threshold=thresh_db, chunk_size=chunk_ms)
-    total = len(audio)
-    lead  = min(lead,  total)
-    trail = min(trail, total - lead)
-    trimmed = audio[lead : total - trail]
-    if lead > 0 or trail > 0:
-        print(f"   🔇 {label}: stripped {lead}ms leading + {trail}ms trailing silence")
-    else:
-        print(f"   ✓  {label}: no edge silence detected")
-    return trimmed, lead / 1000.0
-
-
-def align_to_first_beat(beat_times: list, audio: AudioSegment, label: str = ""):
-    """Snap audio start to the first detected beat and shift timestamps."""
-    offset_s  = beat_times[0]
-    trimmed   = audio[int(offset_s * 1000):]
-    shifted   = [t - offset_s for t in beat_times]
-    new_dur   = len(trimmed) / 1000.0
-    print(f"   ⏱  {label}: snapped {offset_s:.3f}s to first beat  →  {new_dur:.2f}s remaining")
-    return shifted, trimmed, new_dur
-
-
-def match_sample_rate(seg_a: AudioSegment, seg_b: AudioSegment):
-    sr = max(seg_a.frame_rate, seg_b.frame_rate)
-    ch = max(seg_a.channels,   seg_b.channels)
-    if seg_a.frame_rate != sr or seg_a.channels != ch:
-        seg_a = seg_a.set_frame_rate(sr).set_channels(ch)
-    if seg_b.frame_rate != sr or seg_b.channels != ch:
-        seg_b = seg_b.set_frame_rate(sr).set_channels(ch)
-    return seg_a, seg_b
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# BEAT REORDERING MODES
-# ════════════════════════════════════════════════════════════════════════════
-
-def slice_audio_beats(audio: AudioSegment,
-                      beat_times: list, duration: float,
-                      label: str = "") -> list:
-    boundaries = beat_times + [duration]
-    desc = f"✂️  Slicing {label}".strip()
-    return [
-        audio[int(boundaries[i] * 1000) : int(boundaries[i + 1] * 1000)]
-        for i in tqdm(range(len(beat_times)), desc=desc, unit="beat",
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} beats [{elapsed}]")
+def _get_duration(path):
+    """Get duration via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", path,
     ]
+    info = json.loads(
+        subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    )
+    return float(info.get("format", {}).get("duration", 0))
 
 
-def apply_mode(segments: list, mode: str, repeat_times: int = 2) -> list:
+def detect_beats(wav_path, label=""):
+    tag = f" {label}" if label else ""
+    print(f"  Detecting beats{tag} ... ", end="", flush=True)
+    audio = es.MonoLoader(filename=wav_path, sampleRate=44100)()
+    bt, conf = es.BeatTrackerMultiFeature()(audio)
+    dur = len(audio) / 44100.0
+    bpm = 60.0 / np.median(np.diff(bt)) if len(bt) > 1 else 0.0
+    print(f"{len(bt)} beats, {bpm:.1f} BPM, conf {conf:.3f}")
+    return list(bt), bpm, dur
+
+
+def detect_beats_from_np(samples, sr=44100, label=""):
+    """Run beat detection directly on a numpy array (no temp file)."""
+    tag = f" {label}" if label else ""
+    print(f"  Detecting beats{tag} ... ", end="", flush=True)
+    mono = _np_to_mono(samples)
+    if sr != 44100:
+        mono = es.Resample(inputSampleRate=sr, outputSampleRate=44100)(mono)
+        sr = 44100
+    bt, conf = es.BeatTrackerMultiFeature()(mono)
+    dur = len(mono) / float(sr)
+    bpm = 60.0 / np.median(np.diff(bt)) if len(bt) > 1 else 0.0
+    print(f"{len(bt)} beats, {bpm:.1f} BPM, conf {conf:.3f}")
+    return list(bt), bpm, dur
+
+
+# ---------------------------------------------------------------------------
+# Mode application (works on indices or segments)
+# ---------------------------------------------------------------------------
+
+def _apply_mode(segments, mode, repeat_times=2):
     n = len(segments)
     if mode == "remove":
         out = segments[::2]
-        print(f"✂️  Kept {len(out)} of {n} beats (removed every other)")
-
+        print(f"  Kept {len(out)}/{n} beats")
     elif mode == "swap":
         out = []
         for g in range(0, n, 4):
             grp = segments[g:g + 4]
             out += [grp[0], grp[3], grp[2], grp[1]] if len(grp) == 4 else grp
-        print(f"🔀 Swapped beats 2 & 4 in every bar ({n} beats)")
-
+        print(f"  Swapped beats 2 & 4 per bar ({n} beats)")
     elif mode == "reverse":
         out = list(reversed(segments))
-        print(f"⏪ Reversed order of {n} beats")
-
+        print(f"  Reversed {n} beats")
     elif mode == "shuffle":
         out = segments[:]
         random.shuffle(out)
-        print(f"🎲 Shuffled {n} beats randomly")
-
+        print(f"  Shuffled {n} beats")
     elif mode == "repeat":
-        out = [seg for seg in segments for _ in range(repeat_times)]
-        print(f"🔁 Repeated each of {n} beats ×{repeat_times}  →  {len(out)} total")
-
+        out = [s for s in segments for _ in range(repeat_times)]
+        print(f"  Repeated {n} beats x{repeat_times} -> {len(out)}")
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
-
     return out
 
 
-def interleave_beats(segs_a: list, segs_b: list, group: int) -> list:
-    """
-    Alternate beats from two files.
-    group=1 → A B A B ...    group=2 → A A B B A A B B ...
-    """
+def _apply_mode_to_indices(n, mode, repeat_times=2):
+    """Apply mode to index list [0..n-1], return reordered indices."""
+    indices = list(range(n))
+    return _apply_mode(indices, mode, repeat_times)
+
+
+def _interleave(segs_a, segs_b, group):
     total = min(len(segs_a), len(segs_b))
-    out   = []
-    with tqdm(total=total, desc="🔀 Interleaving", unit="beat",
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} beats [{elapsed}]") as pb:
-        for i in range(total):
-            out.append(segs_a[i] if (i // group) % 2 == 0 else segs_b[i])
-            pb.update(1)
-    used_a = sum(1 for i in range(total) if (i // group) % 2 == 0)
-    print(f"   {total} beats total  ({used_a} from A, {total - used_a} from B)")
+    out = [
+        segs_a[i] if (i // group) % 2 == 0 else segs_b[i]
+        for i in range(total)
+    ]
+    from_a = sum(1 for i in range(total) if (i // group) % 2 == 0)
+    print(f"  Interleaved {total} beats ({from_a} A, {total - from_a} B)")
     return out
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# MOVIEPY PROGRESS LOGGER
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Silence / alignment helpers (interleave)
+# ---------------------------------------------------------------------------
 
-class FFmpegProgressBar:
-    _time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+def _strip_silence(audio_seg, label="", thresh=-50, chunk=10):
+    """Strip silence using pydub (used only in interleave path)."""
+    lead = detect_leading_silence(audio_seg, silence_threshold=thresh, chunk_size=chunk)
+    trail = detect_leading_silence(audio_seg.reverse(), silence_threshold=thresh, chunk_size=chunk)
+    n = len(audio_seg)
+    lead = min(lead, n)
+    trail = min(trail, n - lead)
+    trimmed = audio_seg[lead:n - trail]
+    if lead or trail:
+        print(f"  {label}: stripped {lead}ms lead + {trail}ms trail")
+    return trimmed, lead / 1000.0
 
-    def __init__(self, total_duration: float):
-        self.total = total_duration
-        self._pbar = None
+
+def _align_to_beat_np(beat_times, samples, sr, label=""):
+    """Align numpy samples to the first beat."""
+    off = beat_times[0]
+    off_samples = int(off * sr)
+    trimmed = samples[off_samples:]
+    shifted = [t - off for t in beat_times]
+    print(f"  {label}: aligned to first beat at {off:.3f}s")
+    return shifted, trimmed, len(trimmed) / float(sr)
+
+
+def _match_rates_np(a, sr_a, b, sr_b):
+    """Match sample rates and channel counts between two numpy arrays."""
+    sr = max(sr_a, sr_b)
+    if sr_a != sr:
+        a = es.Resample(inputSampleRate=sr_a, outputSampleRate=sr)(
+            _np_to_mono(a) if a.ndim == 1 else a
+        )
+        # For stereo, resample each channel
+        if a.ndim > 1:
+            ch0 = es.Resample(inputSampleRate=sr_a, outputSampleRate=sr)(a[:, 0])
+            ch1 = es.Resample(inputSampleRate=sr_a, outputSampleRate=sr)(a[:, 1])
+            a = np.column_stack([ch0, ch1])
+    if sr_b != sr:
+        if b.ndim > 1:
+            ch0 = es.Resample(inputSampleRate=sr_b, outputSampleRate=sr)(b[:, 0])
+            ch1 = es.Resample(inputSampleRate=sr_b, outputSampleRate=sr)(b[:, 1])
+            b = np.column_stack([ch0, ch1])
+        else:
+            b = es.Resample(inputSampleRate=sr_b, outputSampleRate=sr)(b)
+
+    # Match channels
+    if a.ndim != b.ndim:
+        if a.ndim == 1:
+            a = np.column_stack([a, a])
+        if b.ndim == 1:
+            b = np.column_stack([b, b])
+    elif a.ndim > 1 and a.shape[1] != b.shape[1]:
+        ch = max(a.shape[1], b.shape[1])
+        if a.shape[1] < ch:
+            a = np.column_stack([a] + [a[:, 0:1]] * (ch - a.shape[1]))
+        if b.shape[1] < ch:
+            b = np.column_stack([b] + [b[:, 0:1]] * (ch - b.shape[1]))
+
+    return a, b, sr
+
+
+# ---------------------------------------------------------------------------
+# Moviepy progress logger
+# ---------------------------------------------------------------------------
+
+class _VideoLogger:
+    _re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+    def __init__(self, duration):
+        self.total = duration
+        self._bar = None
         self._last = 0
 
     def iter_bar(self, **bars):
-        name, iterable = next(iter(bars.items()))
-        desc = "🔊 Writing audio" if name == "chunk" else f"📦 {name}"
-        pb = tqdm(total=len(iterable), desc=desc, unit=name,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]")
-        for item in iterable:
+        name, it = next(iter(bars.items()))
+        pb = tqdm(total=len(it), desc=f"  Writing {name}", unit=name,
+                  bar_format=_BAR)
+        for item in it:
             yield item
             pb.update(1)
         pb.close()
@@ -314,200 +650,192 @@ class FFmpegProgressBar:
     def bars_callback(self, bar, attr, value, old_value=None):
         pass
 
-    def __call__(self, message):
-        if self._pbar is None:
-            self._pbar = tqdm(
-                total=int(self.total), desc="🎬 Exporting video", unit="s",
+    def __call__(self, msg):
+        if not self._bar:
+            self._bar = tqdm(
+                total=int(self.total), desc="  Exporting video", unit="s",
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}]",
             )
-        m = self._time_re.search(str(message))
+        m = self._re.search(str(msg))
         if m:
-            cur   = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+            cur = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
             delta = int(cur) - self._last
             if delta > 0:
-                self._pbar.update(delta)
+                self._bar.update(delta)
                 self._last = int(cur)
 
     def close(self):
-        if self._pbar:
-            self._pbar.n = self._pbar.total
-            self._pbar.refresh()
-            self._pbar.close()
+        if self._bar:
+            self._bar.n = self._bar.total
+            self._bar.refresh()
+            self._bar.close()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# STATS & PREVIEW
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Preview (Jupyter / Colab)
+# ---------------------------------------------------------------------------
 
-def print_stats(in_path: str, out_path: str, in_dur: float, out_dur: float):
-    in_mb  = os.path.getsize(in_path)  / 1024 / 1024
-    out_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"\n✅ Done!  {out_path}")
-    print(f"   Original : {in_dur:.2f}s  ({in_mb:.1f} MB)")
-    print(f"   Output   : {out_dur:.2f}s  ({out_mb:.1f} MB)")
-
-
-def preview(output: str, file_is_video: bool = False):
-    """Display an audio player or inline video. Works in Jupyter & Colab."""
+def preview(path):
     from IPython.display import Audio, HTML, display
-    if file_is_video:
-        with open(output, "rb") as f:
+    if _is_video(path):
+        with open(path, "rb") as f:
             data = base64.b64encode(f.read()).decode()
         display(HTML(
-            "<p><b>▶ Processed</b></p>"
-            '<video width="720" controls>'
-            f'<source src="data:video/mp4;base64,{data}" type="video/mp4">'
-            "</video>"
+            f'<video width="720" controls>'
+            f'<source src="data:video/mp4;base64,{data}"></video>'
         ))
     else:
-        print("▶ Processed:")
-        display(Audio(output))
+        display(Audio(path))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# AUDIO PIPELINE
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Public: audio pipeline (numpy-based, no redundant loads)
+# ---------------------------------------------------------------------------
 
-def process_audio(input_path: str, mode: str, fmt: str,
-                  repeat_times: int = 2) -> str:
-    wav, dur = extract_wav(input_path)
-    beat_times, _, duration = detect_beats(wav)
-    os.remove(wav)
+def process_audio(input_path, mode, fmt, repeat_times=2):
+    # Single load
+    samples, sr = _load_np(input_path)
+    dur = len(samples) / float(sr)
 
-    if len(beat_times) < 2:
+    # Beat detection directly from numpy — no temp file
+    bt, _, bdur = detect_beats_from_np(samples, sr)
+    if len(bt) < 2:
         raise ValueError("Too few beats detected.")
 
-    audio    = load_audio(input_path)
-    segments = slice_audio_beats(audio, beat_times, duration)
-    segments = apply_mode(segments, mode, repeat_times)
+    # Slice as numpy arrays — near-zero overhead
+    segments = _slice_np(samples, sr, bt, bdur)
+    segments = _apply_mode(segments, mode, repeat_times)
 
-    with simple_bar("🔗 Stitching") as pb:
-        result = sum(segments[1:], segments[0])
-        pb.update(1)
+    # O(n) concatenation
+    result = _stitch_np(segments)
 
-    suffix = MODE_SUFFIXES.get(mode, mode)
-    out    = make_output_path(input_path, suffix, fmt)
+    out = _out_path(input_path, MODE_SUFFIXES.get(mode, mode), fmt)
+    print(f"  Exporting {fmt} ...")
+    _export_np(result, sr, out, fmt)
 
-    if fmt == "mp3":
-        with simple_bar("💾 Exporting MP3") as pb:
-            result.export(out, format="mp3", bitrate="320k")
-            pb.update(1)
-    else:
-        with simple_bar("💾 Exporting FLAC") as pb:
-            result.export(out, format="flac", parameters=["-compression_level", "8"])
-            pb.update(1)
-
-    print_stats(input_path, out, dur, len(result) / 1000)
+    out_dur = len(result) / float(sr)
+    _print_stats(input_path, out, dur, out_dur)
     return out
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# VIDEO PIPELINE
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Public: video pipeline (stream-copy with re-encode fallback)
+# ---------------------------------------------------------------------------
 
-def process_video(input_path: str, mode: str, repeat_times: int = 2) -> str:
-    if not _MOVIEPY_AVAILABLE:
-        raise ImportError("moviepy is required for video. Install it with: pip install moviepy")
+def process_video(input_path, mode, repeat_times=2):
+    if not _MOVIEPY:
+        raise ImportError("moviepy required for video fallback: pip install moviepy")
 
-    probe         = probe_video(input_path)
-    export_kwargs = build_video_export_params(probe)
+    probe = _probe_video(input_path)
+    _detect_encoder()       # probe + cache early
+    _detect_hwaccel()       # probe + cache early
 
-    wav, video_dur = extract_wav(input_path)
-    beat_times, _, duration = detect_beats(wav)
+    # Extract audio for beat detection using ffmpeg with hwaccel
+    wav = _extract_audio_to_wav(input_path)
+    vdur = probe.get("duration") or _get_duration(input_path)
+    bt, _, bdur = detect_beats(wav)
     os.remove(wav)
-
-    if len(beat_times) < 2:
+    if len(bt) < 2:
         raise ValueError("Too few beats detected.")
 
-    boundaries = beat_times + [min(duration, video_dur)]
-    video      = VideoFileClip(input_path)
+    # Build time segments
+    bounds = bt + [min(bdur, vdur)]
+    time_segments = []
+    for i in range(len(bt)):
+        ts, te = bounds[i], min(bounds[i + 1], vdur)
+        if te - ts >= 0.01:
+            time_segments.append((ts, te))
 
-    segments = []
-    for i in tqdm(range(len(beat_times)), desc="✂️  Slicing", unit="beat",
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} beats [{elapsed}]"):
-        t_s, t_e = boundaries[i], min(boundaries[i + 1], video.duration)
-        if t_e - t_s >= 0.01:
-            segments.append(video.subclip(t_s, t_e))
+    # Apply mode to indices, then reorder time segments
+    indices = _apply_mode_to_indices(len(time_segments), mode, repeat_times)
+    ordered_segments = [time_segments[i] for i in indices]
 
-    segments = apply_mode(segments, mode, repeat_times)
+    out = _out_path(input_path, MODE_SUFFIXES.get(mode, mode), "mp4")
 
-    with simple_bar("🔗 Concatenating") as pb:
-        result = concatenate_videoclips(segments, method="compose")
-        pb.update(1)
+    # Try stream-copy concat first (10-50× faster)
+    print("  Attempting stream-copy concat (no re-encode) ...")
+    if _ffmpeg_concat_copy(ordered_segments, input_path, out, probe):
+        out_dur = sum(te - ts for ts, te in ordered_segments)
+        _print_stats(input_path, out, vdur, out_dur)
+        return out
 
-    suffix = MODE_SUFFIXES.get(mode, mode)
-    out    = make_output_path(input_path, suffix, "mp4")
+    # Fallback: moviepy re-encode
+    print("  Stream-copy failed, falling back to re-encode ...")
+    video = VideoFileClip(input_path)
 
-    logger = FFmpegProgressBar(result.duration)
-    result.write_videofile(out, logger=logger, **export_kwargs)
-    logger.close()
+    clips = []
+    for i in tqdm(range(len(ordered_segments)), desc="  Slicing",
+                  unit="beat", bar_format=_BAR):
+        ts, te = ordered_segments[i]
+        te = min(te, video.duration)
+        if te - ts >= 0.01:
+            clips.append(video.subclip(ts, te))
 
+    result = concatenate_videoclips(clips, method="compose")
+    _write_video(result, out, probe)
+
+    out_dur = result.duration
     video.close()
     result.close()
-
-    print_stats(input_path, out, video_dur, result.duration)
+    _print_stats(input_path, out, vdur, out_dur)
     return out
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# INTERLEAVE PIPELINE
-# ════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Public: interleave pipeline (numpy + parallel beat detection)
+# ---------------------------------------------------------------------------
 
-def process_interleave(path_a: str, path_b: str, group: int, fmt: str) -> str:
-    print(f"\n🎵 File A : {os.path.basename(path_a)}")
-    print(f"🎵 File B : {os.path.basename(path_b)}")
-    print(f"   Group  : {group} beat(s) per file before switching")
+def process_interleave(path_a, path_b, group, fmt):
+    print(f"\nFile A: {os.path.basename(path_a)}")
+    print(f"File B: {os.path.basename(path_b)}")
+    print(f"Group:  {group}")
 
-    print("\n📦 Loading audio files...")
-    audio_a = load_audio(path_a)
-    audio_b = load_audio(path_b)
-    audio_a, audio_b = match_sample_rate(audio_a, audio_b)
+    # Load both files
+    samples_a, sr_a = _load_np(path_a)
+    samples_b, sr_b = _load_np(path_b)
 
-    print("\n🔇 Stripping edge silence...")
-    audio_a, _ = strip_silence(audio_a, "File A")
-    audio_b, _ = strip_silence(audio_b, "File B")
+    # Match sample rates and channels
+    samples_a, samples_b, sr = _match_rates_np(samples_a, sr_a, samples_b, sr_b)
 
-    print()
-    wav_a = extract_wav_from_segment(audio_a)
-    wav_b = extract_wav_from_segment(audio_b)
-    bt_a, bpm_a, dur_a = detect_beats(wav_a, "(File A)")
-    bt_b, bpm_b, dur_b = detect_beats(wav_b, "(File B)")
-    os.remove(wav_a)
-    os.remove(wav_b)
+    # Strip silence using pydub (best silence detection)
+    seg_a = _np_to_pydub(samples_a, sr)
+    seg_b = _np_to_pydub(samples_b, sr)
 
-    print("\n🎯 Aligning to first beat...")
-    bt_a, audio_a, dur_a = align_to_first_beat(bt_a, audio_a, "File A")
-    bt_b, audio_b, dur_b = align_to_first_beat(bt_b, audio_b, "File B")
+    seg_a, lead_a = _strip_silence(seg_a, "A")
+    seg_b, lead_b = _strip_silence(seg_b, "B")
 
-    bpm_diff = abs(bpm_a - bpm_b)
-    if bpm_diff > 5:
-        print(f"\n   ⚠️  BPM difference: {bpm_a:.1f} vs {bpm_b:.1f} ({bpm_diff:.1f} apart)")
-        print( "      Beat lengths will differ — splices land on beat but durations won't match.")
-    else:
-        print(f"\n   ✓  BPMs close: {bpm_a:.1f} vs {bpm_b:.1f} ({bpm_diff:.1f} apart) — tight alignment expected")
+    # Convert back to numpy after stripping
+    samples_a, _ = _pydub_to_np(seg_a)
+    samples_b, _ = _pydub_to_np(seg_b)
 
-    segs_a      = slice_audio_beats(audio_a, bt_a, dur_a, "File A")
-    segs_b      = slice_audio_beats(audio_b, bt_b, dur_b, "File B")
-    interleaved = interleave_beats(segs_a, segs_b, group)
+    # Parallel beat detection — no temp files
+    print("  Running parallel beat detection ...")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_a = ex.submit(detect_beats_from_np, samples_a, sr, "(A)")
+        fut_b = ex.submit(detect_beats_from_np, samples_b, sr, "(B)")
+        bt_a, bpm_a, dur_a = fut_a.result()
+        bt_b, bpm_b, dur_b = fut_b.result()
 
-    with simple_bar("🔗 Stitching") as pb:
-        result = sum(interleaved[1:], interleaved[0])
-        pb.update(1)
+    # Align to first beat
+    bt_a, samples_a, dur_a = _align_to_beat_np(bt_a, samples_a, sr, "A")
+    bt_b, samples_b, dur_b = _align_to_beat_np(bt_b, samples_b, sr, "B")
 
-    base_b = os.path.basename(os.path.splitext(path_b)[0])
-    suffix = f"interleaved_with_{base_b}_group{group}"
-    out    = make_output_path(path_a, suffix, fmt)
+    diff = abs(bpm_a - bpm_b)
+    if diff > 5:
+        print(f"  Warning: BPM gap {bpm_a:.1f} vs {bpm_b:.1f} ({diff:.1f} apart)")
 
-    if fmt == "mp3":
-        with simple_bar("💾 Exporting MP3") as pb:
-            result.export(out, format="mp3", bitrate="320k")
-            pb.update(1)
-    else:
-        with simple_bar("💾 Exporting FLAC") as pb:
-            result.export(out, format="flac", parameters=["-compression_level", "8"])
-            pb.update(1)
+    # Slice, interleave, stitch — all numpy
+    segs_a = _slice_np(samples_a, sr, bt_a, dur_a, "A")
+    segs_b = _slice_np(samples_b, sr, bt_b, dur_b, "B")
+    interleaved = _interleave(segs_a, segs_b, group)
+    result = _stitch_np(interleaved)
 
-    out_mb = os.path.getsize(out) / 1024 / 1024
-    print(f"\n✅ Done!  {out}")
-    print(f"   Duration : {len(result)/1000:.2f}s  ({out_mb:.1f} MB)")
+    base_b = os.path.splitext(os.path.basename(path_b))[0]
+    out = _out_path(path_a, f"interleaved_with_{base_b}_group{group}", fmt)
+    print(f"  Exporting {fmt} ...")
+    _export_np(result, sr, out, fmt)
+
+    print(f"\nDone: {out}")
+    out_dur = len(result) / float(sr)
+    print(f"  Duration: {out_dur:.2f}s  ({_mb(out):.1f} MB)")
     return out
