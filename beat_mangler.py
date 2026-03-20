@@ -7,7 +7,6 @@ import base64
 import json
 import os
 import random
-import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -19,11 +18,7 @@ from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
 from tqdm.auto import tqdm
 
-try:
-    from moviepy.editor import VideoFileClip, concatenate_videoclips
-    _MOVIEPY = True
-except ImportError:
-    _MOVIEPY = False
+
 
 
 # ---------------------------------------------------------------------------
@@ -313,153 +308,114 @@ def _probe_video(path):
 # Encoding parameter builders
 # ---------------------------------------------------------------------------
 
-def _encode_params(codec, preset, probe):
-    """Build moviepy write_videofile kwargs for the given encoder."""
+
+# ---------------------------------------------------------------------------
+# FFmpeg filter_complex concat (single-pass re-encode, frame-accurate)
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_concat_reencode(segment_times, input_path, output_path, probe):
+    """Cut and concatenate segments in a single ffmpeg pass using filter_complex.
+
+    Stream-copy cannot be used here: beat boundaries almost never land on
+    keyframes, so any copy-based cut drifts to the nearest keyframe and
+    produces wrong segment lengths/content.  A filter_complex trim+concat
+    approach decodes once, trims frame-accurately, and re-encodes once —
+    far more reliable than copy and still much faster than multiple passes.
+    """
+    n = len(segment_times)
+    if n == 0:
+        return False
+
+    codec, label, preset = _detect_encoder()
+    hwaccel_args = _hwaccel_decode_args()
     br      = probe["v_kbps"]
     abr     = min(320, max(128, probe["audio_kbps"]))
     maxrate = int(br * 1.5)
     bufsize = br * 2
 
-    params = ["-pix_fmt", probe["pix_fmt"], "-profile:v", "high"]
+    # Build filter_complex:
+    #   For each segment i: trim video + audio, reset pts, label outputs.
+    #   Then concat all labelled pairs.
+    filter_parts = []
+    for i, (ts, te) in enumerate(segment_times):
+        filter_parts.append(
+            f"[0:v]trim=start={ts:.6f}:end={te:.6f},setpts=PTS-STARTPTS[v{i}];"
+            f"[0:a]atrim=start={ts:.6f}:end={te:.6f},asetpts=PTS-STARTPTS[a{i}]"
+        )
 
+    v_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
+    filter_parts.append(f"{v_inputs}concat=n={n}:v=1:a=1[vout][aout]")
+    filter_complex = ";".join(filter_parts)
+
+    # Encode params
     if codec == "h264_nvenc":
-        params += [
-            "-rc", "vbr",
-            "-b:v", f"{br}k",
-            "-maxrate", f"{maxrate}k",
-            "-bufsize", f"{bufsize}k",
+        enc_args = [
+            "-c:v", codec, "-preset", preset,
+            "-rc", "vbr", "-b:v", f"{br}k",
+            "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
         ]
     elif codec == "h264_amf":
-        params += [
-            "-rc", "vbr_peak",
-            "-b:v", f"{br}k",
+        enc_args = [
+            "-c:v", codec, "-quality", preset,
+            "-rc", "vbr_peak", "-b:v", f"{br}k",
             "-maxrate", f"{maxrate}k",
         ]
     elif codec == "h264_qsv":
-        params += [
+        enc_args = [
+            "-c:v", codec, "-preset", preset,
             "-b:v", f"{br}k",
-            "-maxrate", f"{maxrate}k",
-            "-bufsize", f"{bufsize}k",
+            "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
         ]
     else:
         crf = (16 if br >= 8000 else 18 if br >= 4000 else
                20 if br >= 2000 else 22 if br >= 1000 else 24)
-        params += [
+        enc_args = [
+            "-c:v", "libx264", "-preset", preset,
             "-crf", str(crf),
-            "-maxrate", f"{maxrate}k",
-            "-bufsize", f"{bufsize}k",
+            "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
         ]
 
-    return dict(
-        codec=codec,
-        preset=preset,
-        audio_codec="aac",
-        fps=probe["fps"],
-        audio_bitrate=f"{abr}k",
-        audio_fps=probe["audio_sr"],
-        verbose=False,
-        ffmpeg_params=params,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Video writer (GPU with automatic CPU fallback)
-# ---------------------------------------------------------------------------
-
-def _write_video(clip, path, probe):
-    """Encode clip using the best available encoder with CPU fallback."""
-    codec, label, preset = _detect_encoder()
-    br  = probe["v_kbps"]
-    abr = min(320, max(128, probe["audio_kbps"]))
-    print(f"  Encoding with {label} | preset={preset}")
-    print(f"  Target: {probe['width']}x{probe['height']} @ {probe['fps']}fps, "
-          f"~{br} kbps video, {abr} kbps audio")
-
-    kwargs = _encode_params(codec, preset, probe)
-    logger = _VideoLogger(clip.duration)
-
-    try:
-        clip.write_videofile(path, logger=logger, **kwargs)
-        logger.close()
-        return
-    except Exception as exc:
-        logger.close()
-        if codec == "libx264":
-            raise
-        print(f"\n  {label} encoding failed: {exc}")
-        print("  Retrying with libx264 (CPU) ...")
-
-    kwargs = _encode_params("libx264", "slow", probe)
-    logger = _VideoLogger(clip.duration)
-    clip.write_videofile(path, logger=logger, **kwargs)
-    logger.close()
-
-
-# ---------------------------------------------------------------------------
-# FFmpeg stream-copy concat (no re-encode)
-# ---------------------------------------------------------------------------
-
-def _ffmpeg_concat_copy(segment_times, input_path, output_path, probe):
-    """Cut segments with ffmpeg stream copy and concatenate without re-encoding.
-
-    This avoids decoding/encoding entirely — 10-50× faster than re-encode.
-    Falls back to moviepy re-encode pipeline on failure.
-    """
-    tmp_dir = tempfile.mkdtemp()
-    list_file = os.path.join(tmp_dir, "concat.txt")
-    hwaccel_args = _hwaccel_decode_args()
-
-    parts = []
-    print("  Cutting segments (stream copy) ...")
-    for i in tqdm(range(len(segment_times)), desc="  Cutting",
-                  unit="seg", bar_format=_BAR):
-        ts, te = segment_times[i]
-        part = os.path.join(tmp_dir, f"part_{i:05d}.ts")
-        cmd = ["ffmpeg", "-y"]
-        cmd += hwaccel_args
-        cmd += [
-            "-ss", f"{ts:.6f}", "-to", f"{te:.6f}",
-            "-i", input_path,
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            "-f", "mpegts",
-            part,
-        ]
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode != 0:
-            # Cleanup and signal failure
-            for p in parts:
-                if os.path.exists(p):
-                    os.remove(p)
-            if os.path.exists(list_file):
-                os.remove(list_file)
-            os.rmdir(tmp_dir)
-            return False
-        parts.append(part)
-
-    with open(list_file, "w") as f:
-        for p in parts:
-            f.write(f"file '{p}'\n")
-
-    print("  Concatenating segments ...")
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", list_file, "-c", "copy", output_path,
+    cmd = ["ffmpeg", "-y"] + hwaccel_args + ["-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-pix_fmt", probe["pix_fmt"], "-profile:v", "high",
+    ] + enc_args + [
+        "-c:a", "aac", "-b:a", f"{abr}k",
+        "-ar", str(probe["audio_sr"]),
+        output_path,
     ]
+
+    print(f"  Encoding with {label} (single-pass filter_complex concat) ...")
     r = subprocess.run(cmd, capture_output=True)
 
-    # Cleanup temp files
-    for p in parts:
-        if os.path.exists(p):
-            os.remove(p)
-    if os.path.exists(list_file):
-        os.remove(list_file)
-    try:
-        os.rmdir(tmp_dir)
-    except OSError:
-        pass
+    if r.returncode != 0:
+        # If GPU encoder failed, retry with libx264
+        if codec != "libx264":
+            print(f"  {label} failed, retrying with libx264 ...")
+            # Swap out encoder args
+            crf = (16 if br >= 8000 else 18 if br >= 4000 else
+                   20 if br >= 2000 else 22 if br >= 1000 else 24)
+            cpu_enc = [
+                "-c:v", "libx264", "-preset", "slow",
+                "-crf", str(crf),
+                "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
+            ]
+            cmd2 = ["ffmpeg", "-y", "-i", input_path,
+                "-filter_complex", filter_complex,
+                "-map", "[vout]", "-map", "[aout]",
+                "-pix_fmt", probe["pix_fmt"], "-profile:v", "high",
+            ] + cpu_enc + [
+                "-c:a", "aac", "-b:a", f"{abr}k",
+                "-ar", str(probe["audio_sr"]),
+                output_path,
+            ]
+            r = subprocess.run(cmd2, capture_output=True)
 
-    return r.returncode == 0
+    if r.returncode != 0:
+        print(f"  ffmpeg error:\n{r.stderr.decode(errors='replace')[-2000:]}")
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -626,50 +582,6 @@ def _match_rates_np(a, sr_a, b, sr_b):
     return a, b, sr
 
 
-# ---------------------------------------------------------------------------
-# Moviepy progress logger
-# ---------------------------------------------------------------------------
-
-class _VideoLogger:
-    _re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-
-    def __init__(self, duration):
-        self.total = duration
-        self._bar = None
-        self._last = 0
-
-    def iter_bar(self, **bars):
-        name, it = next(iter(bars.items()))
-        pb = tqdm(total=len(it), desc=f"  Writing {name}", unit=name,
-                  bar_format=_BAR)
-        for item in it:
-            yield item
-            pb.update(1)
-        pb.close()
-
-    def bars_callback(self, bar, attr, value, old_value=None):
-        pass
-
-    def __call__(self, msg):
-        if not self._bar:
-            self._bar = tqdm(
-                total=int(self.total), desc="  Exporting video", unit="s",
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}]",
-            )
-        m = self._re.search(str(msg))
-        if m:
-            cur = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
-            delta = int(cur) - self._last
-            if delta > 0:
-                self._bar.update(delta)
-                self._last = int(cur)
-
-    def close(self):
-        if self._bar:
-            self._bar.n = self._bar.total
-            self._bar.refresh()
-            self._bar.close()
-
 
 # ---------------------------------------------------------------------------
 # Preview (Jupyter / Colab)
@@ -719,13 +631,10 @@ def process_audio(input_path, mode, fmt, repeat_times=2):
 
 
 # ---------------------------------------------------------------------------
-# Public: video pipeline (stream-copy with re-encode fallback)
+# Public: video pipeline (single-pass filter_complex re-encode)
 # ---------------------------------------------------------------------------
 
 def process_video(input_path, mode, repeat_times=2):
-    if not _MOVIEPY:
-        raise ImportError("moviepy required for video fallback: pip install moviepy")
-
     probe = _probe_video(input_path)
     _detect_encoder()       # probe + cache early
     _detect_hwaccel()       # probe + cache early
@@ -752,31 +661,13 @@ def process_video(input_path, mode, repeat_times=2):
 
     out = _out_path(input_path, MODE_SUFFIXES.get(mode, mode), "mp4")
 
-    # Try stream-copy concat first (10-50× faster)
-    print("  Attempting stream-copy concat (no re-encode) ...")
-    if _ffmpeg_concat_copy(ordered_segments, input_path, out, probe):
-        out_dur = sum(te - ts for ts, te in ordered_segments)
-        _print_stats(input_path, out, vdur, out_dur)
-        return out
+    if not _ffmpeg_concat_reencode(ordered_segments, input_path, out, probe):
+        raise RuntimeError(
+            "ffmpeg filter_complex concat failed. "
+            "Check that ffmpeg is installed and the input file is valid."
+        )
 
-    # Fallback: moviepy re-encode
-    print("  Stream-copy failed, falling back to re-encode ...")
-    video = VideoFileClip(input_path)
-
-    clips = []
-    for i in tqdm(range(len(ordered_segments)), desc="  Slicing",
-                  unit="beat", bar_format=_BAR):
-        ts, te = ordered_segments[i]
-        te = min(te, video.duration)
-        if te - ts >= 0.01:
-            clips.append(video.subclip(ts, te))
-
-    result = concatenate_videoclips(clips, method="compose")
-    _write_video(result, out, probe)
-
-    out_dur = result.duration
-    video.close()
-    result.close()
+    out_dur = sum(te - ts for ts, te in ordered_segments)
     _print_stats(input_path, out, vdur, out_dur)
     return out
 
